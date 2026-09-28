@@ -38,6 +38,10 @@ STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
 
+# Payment gateway strategy: which adapter implements PaymentGateway?
+# (see core/gateways/ — add new providers to the GATEWAYS registry)
+PAYMENT_GATEWAY = os.getenv('PAYMENT_GATEWAY', 'stripe')
+
 # Application definition
 
 INSTALLED_APPS = [

@@ -2,11 +2,19 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from .gateways import (
+    PaymentEvent,
+    PaymentEventType,
+    PaymentGateway,
+    PaymentIntentResult,
+    get_payment_gateway,
+)
+from .gateways.stripe_gateway import StripeGateway
 from .models import Cart, Category, Order, Product
 from .services import cart_service, checkout_service, payment_service
 from .services.exceptions import (
@@ -19,6 +27,34 @@ from .services.exceptions import (
 )
 
 User = get_user_model()
+
+
+class FakePaymentGateway(PaymentGateway):
+    """Hand-rolled test double: exercises the Strategy contract without Stripe."""
+
+    def __init__(self, *, fail=False, event=None, accept_signature="valid_sig"):
+        self.fail = fail
+        self.event = event
+        self.accept_signature = accept_signature
+        self.intents = []
+
+    def create_intent(self, *, amount, currency, metadata=None):
+        if self.fail:
+            raise PaymentError("Payment gateway unavailable")
+        self.intents.append(
+            {"amount": amount, "currency": currency, "metadata": metadata}
+        )
+        return PaymentIntentResult(
+            intent_id="pi_fake",
+            client_secret="cs_fake",
+            amount=amount,
+            currency=currency,
+        )
+
+    def parse_webhook_event(self, payload, signature):
+        if signature != self.accept_signature:
+            raise PaymentError("Invalid webhook signature")
+        return self.event
 
 
 class AuthTests(TestCase):
@@ -111,44 +147,6 @@ class CartTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class CheckoutTests(TestCase):
-    def setUp(self):
-        self.client = APIClient()
-        self.user = User.objects.create_user(username='checkoutuser', email='checkout@example.com', password='password123')
-        self.client.force_authenticate(user=self.user)
-        
-        self.category = Category.objects.create(name='Gadgets', slug='gadgets')
-        self.product = Product.objects.create(
-            name='Smartwatch',
-            description='A smart watch',
-            price=Decimal('199.99'),
-            stock=2,
-            category=self.category
-        )
-        
-        self.cart = Cart.objects.create(user=self.user)
-        self.product.cart_items.create(cart=self.cart, quantity=1)
-        
-        self.checkout_url = reverse('checkout')
-
-    @patch('core.services.checkout_service.stripe.PaymentIntent.create')
-    def test_checkout_success(self, mock_stripe_create):
-        # Mock the Stripe response
-        mock_stripe_create.return_value = MagicMock(
-            id='pi_test_123',
-            client_secret='sk_test_secret'
-        )
-        
-        data = {'shipping_address': '123 Test St'}
-        response = self.client.post(self.checkout_url, data, format='json')
-        
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertIn('client_secret', response.data)
-        
-        # Verify Order was created
-        self.assertTrue(Order.objects.filter(user=self.user, stripe_payment_intent_id='pi_test_123').exists())
-
-
 class CartServiceTests(TestCase):
     """Business rules of the cart, tested below the HTTP layer."""
 
@@ -186,9 +184,8 @@ class CartServiceTests(TestCase):
         self.assertFalse(Cart.objects.get(user=self.user).items.exists())
 
 
-@patch('core.services.checkout_service.stripe.PaymentIntent.create')
 class CheckoutServiceTests(TestCase):
-    """Checkout orchestration without the HTTP layer."""
+    """Checkout orchestration driven by an injected gateway (Strategy)."""
 
     def setUp(self):
         self.user = User.objects.create_user(
@@ -200,23 +197,42 @@ class CheckoutServiceTests(TestCase):
             stock=5, category=self.category,
         )
 
-    def test_checkout_empty_cart_raises(self, mock_create):
-        Cart.objects.create(user=self.user)  # cart exists but has no items
-        with self.assertRaises(EmptyCartError):
-            checkout_service.checkout(user=self.user)
-        mock_create.assert_not_called()
-
-    def test_checkout_missing_cart_raises(self, mock_create):
+    def test_checkout_missing_cart_raises(self):
+        gateway = FakePaymentGateway()
         with self.assertRaises(CartNotFoundError):
-            checkout_service.checkout(user=self.user)
-        mock_create.assert_not_called()
+            checkout_service.checkout(user=self.user, gateway=gateway)
+        self.assertEqual(gateway.intents, [])
 
-    def test_checkout_snapshots_order_items(self, mock_create):
-        mock_create.return_value = MagicMock(id='pi_snap', client_secret='cs_snap')
+    def test_checkout_empty_cart_raises(self):
+        Cart.objects.create(user=self.user)  # cart exists but has no items
+        gateway = FakePaymentGateway()
+        with self.assertRaises(EmptyCartError):
+            checkout_service.checkout(user=self.user, gateway=gateway)
+        self.assertEqual(gateway.intents, [])
+
+    def test_checkout_creates_pending_order_via_gateway(self):
+        Cart.objects.create(user=self.user)
+        cart_service.add_item(user=self.user, product_id=self.product.id, quantity=2)
+        gateway = FakePaymentGateway()
+
+        result = checkout_service.checkout(
+            user=self.user, shipping_address='Av. Siempre Viva 742', gateway=gateway
+        )
+
+        self.assertEqual(result.order.status, Order.Status.PENDING)
+        self.assertEqual(result.order.total_amount, Decimal('40.00'))
+        self.assertEqual(result.intent.intent_id, 'pi_fake')
+        self.assertEqual(gateway.intents[0]['amount'], Decimal('40.00'))
+        self.assertEqual(gateway.intents[0]['metadata']['user_id'], self.user.id)
+
+    def test_checkout_snapshots_order_items(self):
         Cart.objects.create(user=self.user)
         cart_service.add_item(user=self.user, product_id=self.product.id, quantity=2)
 
-        result = checkout_service.checkout(user=self.user, shipping_address='Av. Siempre Viva 742')
+        result = checkout_service.checkout(
+            user=self.user, shipping_address='Av. Siempre Viva 742',
+            gateway=FakePaymentGateway(),
+        )
 
         # Price changes after checkout: the order must not be affected
         Product.objects.filter(pk=self.product.pk).update(price=Decimal('99.99'))
@@ -227,14 +243,23 @@ class CheckoutServiceTests(TestCase):
         self.assertEqual(item.price, Decimal('20.00'))
         self.assertEqual(item.product_name, 'Vinyl')
 
-    def test_checkout_insufficient_stock_raises(self, mock_create):
+    def test_checkout_insufficient_stock_never_calls_gateway(self):
         Cart.objects.create(user=self.user)
         cart_service.add_item(user=self.user, product_id=self.product.id, quantity=1)
         Product.objects.filter(pk=self.product.pk).update(stock=0)
+        gateway = FakePaymentGateway()
 
         with self.assertRaises(OutOfStockError):
-            checkout_service.checkout(user=self.user)
-        mock_create.assert_not_called()
+            checkout_service.checkout(user=self.user, gateway=gateway)
+        self.assertEqual(gateway.intents, [])
+
+    def test_gateway_failure_leaves_no_order(self):
+        Cart.objects.create(user=self.user)
+        cart_service.add_item(user=self.user, product_id=self.product.id, quantity=1)
+
+        with self.assertRaises(PaymentError):
+            checkout_service.checkout(user=self.user, gateway=FakePaymentGateway(fail=True))
+        self.assertFalse(Order.objects.exists())
 
 
 class PaymentServiceTests(TestCase):
@@ -258,17 +283,31 @@ class PaymentServiceTests(TestCase):
             price=self.product.price, quantity=2,
         )
 
+    @staticmethod
+    def _event(event_type, intent_id='pi_wh_1'):
+        return PaymentEvent(type=event_type, intent_id=intent_id)
+
     def test_invalid_signature_raises(self):
+        # Goes through the real Stripe adapter: bad signature must be rejected
         with self.assertRaises(PaymentError):
             payment_service.process_webhook(b'{}', 'bad_sig')
 
-    @patch('core.services.payment_service.stripe.Webhook.construct_event')
-    def test_payment_succeeded_marks_order_paid_and_reduces_stock(self, mock_construct):
-        mock_construct.return_value = {
-            'type': 'payment_intent.succeeded',
-            'data': {'object': {'id': 'pi_wh_1'}},
-        }
-        action = payment_service.process_webhook(b'{}', 'sig')
+    def test_process_webhook_delegates_to_gateway(self):
+        gateway = FakePaymentGateway(
+            event=self._event(PaymentEventType.PAYMENT_SUCCEEDED)
+        )
+        action = payment_service.process_webhook(b'{}', 'valid_sig', gateway=gateway)
+        self.assertEqual(action, 'paid')
+
+    def test_irrelevant_event_is_ignored(self):
+        gateway = FakePaymentGateway(event=None)  # gateway returns None for unknown types
+        action = payment_service.process_webhook(b'{}', 'valid_sig', gateway=gateway)
+        self.assertEqual(action, 'ignored')
+
+    def test_payment_succeeded_marks_order_paid_and_reduces_stock(self):
+        action = payment_service.process_payment_event(
+            self._event(PaymentEventType.PAYMENT_SUCCEEDED)
+        )
 
         self.assertEqual(action, 'paid')
         self.order.refresh_from_db()
@@ -277,34 +316,89 @@ class PaymentServiceTests(TestCase):
         self.assertEqual(self.product.stock, 2)
         self.assertFalse(Cart.objects.filter(user=self.user).exists())
 
-    @patch('core.services.payment_service.stripe.Webhook.construct_event')
-    def test_webhook_retry_is_idempotent(self, mock_construct):
-        mock_construct.return_value = {
-            'type': 'payment_intent.succeeded',
-            'data': {'object': {'id': 'pi_wh_1'}},
-        }
-        payment_service.process_webhook(b'{}', 'sig')
-        payment_service.process_webhook(b'{}', 'sig')  # Stripe retries deliveries
+    def test_webhook_retry_is_idempotent(self):
+        event = self._event(PaymentEventType.PAYMENT_SUCCEEDED)
+        payment_service.process_payment_event(event)
+        payment_service.process_payment_event(event)  # Stripe retries deliveries
 
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 2)  # stock reduced only once
 
-    @patch('core.services.payment_service.stripe.Webhook.construct_event')
-    def test_payment_failed_marks_order_failed(self, mock_construct):
-        mock_construct.return_value = {
-            'type': 'payment_intent.payment_failed',
-            'data': {'object': {'id': 'pi_wh_1'}},
-        }
-        payment_service.process_webhook(b'{}', 'sig')
+    def test_payment_failed_marks_order_failed(self):
+        action = payment_service.process_payment_event(
+            self._event(PaymentEventType.PAYMENT_FAILED)
+        )
 
+        self.assertEqual(action, 'failed')
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, Order.Status.FAILED)
 
-    @patch('core.services.payment_service.stripe.Webhook.construct_event')
-    def test_unknown_order_raises(self, mock_construct):
-        mock_construct.return_value = {
-            'type': 'payment_intent.succeeded',
-            'data': {'object': {'id': 'pi_unknown'}},
-        }
+    def test_unknown_order_raises(self):
         with self.assertRaises(OrderNotFoundError):
-            payment_service.process_webhook(b'{}', 'sig')
+            payment_service.process_payment_event(
+                self._event(PaymentEventType.PAYMENT_SUCCEEDED, intent_id='pi_unknown')
+            )
+
+
+class GatewayFactoryTests(TestCase):
+    """The factory selects the strategy from settings."""
+
+    def test_default_gateway_is_stripe(self):
+        self.assertIsInstance(get_payment_gateway(), StripeGateway)
+
+    @override_settings(PAYMENT_GATEWAY='paypal')
+    def test_unknown_gateway_raises_loudly(self):
+        with self.assertRaises(ValueError) as ctx:
+            get_payment_gateway()
+        self.assertIn('paypal', str(ctx.exception))
+
+    @override_settings(PAYMENT_GATEWAY='stripe')
+    def test_registered_gateway_is_accepted(self):
+        self.assertIsInstance(get_payment_gateway(), StripeGateway)
+
+
+@patch('core.gateways.stripe_gateway.stripe.PaymentIntent.create')
+class CheckoutTests(TestCase):
+    """End-to-end checkout through the API with the real Stripe adapter mocked."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(username='checkoutuser', email='checkout@example.com', password='password123')
+        self.client.force_authenticate(user=self.user)
+        
+        self.category = Category.objects.create(name='Gadgets', slug='gadgets')
+        self.product = Product.objects.create(
+            name='Smartwatch',
+            description='A smart watch',
+            price=Decimal('199.99'),
+            stock=2,
+            category=self.category
+        )
+        
+        self.cart = Cart.objects.create(user=self.user)
+        self.product.cart_items.create(cart=self.cart, quantity=1)
+        
+        self.checkout_url = reverse('checkout')
+
+    def test_checkout_success(self, mock_stripe_create):
+        # Mock the Stripe response
+        mock_stripe_create.return_value = MagicMock(
+            id='pi_test_123',
+            client_secret='sk_test_secret'
+        )
+        
+        data = {'shipping_address': '123 Test St'}
+        response = self.client.post(self.checkout_url, data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn('client_secret', response.data)
+        
+        # Verify Order was created
+        self.assertTrue(Order.objects.filter(user=self.user, stripe_payment_intent_id='pi_test_123').exists())
+
+    def test_checkout_rejects_empty_cart(self, mock_stripe_create):
+        self.cart.items.all().delete()  # cart exists, but with no items
+        response = self.client.post(self.checkout_url, {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_stripe_create.assert_not_called()

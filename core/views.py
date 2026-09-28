@@ -198,7 +198,7 @@ class CheckoutView(APIView):
 
         return Response({
             'order_id': result.order.id,
-            'client_secret': result.client_secret,
+            'client_secret': result.intent.client_secret,
             'total_amount': str(result.order.total_amount),
         }, status=status.HTTP_201_CREATED)
 

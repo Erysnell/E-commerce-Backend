@@ -17,9 +17,51 @@ An e-commerce platform backend built with **Django** and **Django Rest Framework
 
 - **Backend**: Django, Django Rest Framework
 - **Authentication**: `djangorestframework-simplejwt`
-- **Payments**: Stripe
+- **Payments**: Pluggable gateway (Stripe by default)
 - **Documentation**: `drf-spectacular` (OpenAPI 3)
 - **Database**: SQLite (Default) / PostgreSQL (Configurable)
+
+## Project Architecture
+
+The backend is a **layered monolith**: views are thin HTTP adapters, business
+rules live in a service layer, and external providers sit behind interfaces.
+
+```
+core/
+├── views.py            # Presentation: HTTP in/out, domain errors → status codes
+├── serializers.py      # DTOs: request validation & response shaping
+├── services/           # Service layer: all business rules
+│   ├── exceptions.py       # DomainError hierarchy (no HTTP concepts)
+│   ├── cart_service.py     # stock rules, quantity merging
+│   ├── checkout_service.py # totals, order snapshot, gateway orchestration
+│   └── payment_service.py  # webhook → order state transitions (idempotent)
+├── gateways/           # Payment ports & adapters (Strategy pattern)
+│   ├── base.py             # PaymentGateway ABC + PaymentEvent/Result
+│   ├── stripe_gateway.py   # Stripe adapter
+│   └── factory.py          # runtime selection via settings.PAYMENT_GATEWAY
+└── models.py           # Persistence (Active Record via Django ORM)
+```
+
+Key design decisions:
+
+- **Service Layer**: services raise `DomainError` subclasses and never build
+  HTTP responses; views translate errors to status codes. This lets you reuse
+  the same logic from tasks, the admin, or a future frontend.
+- **Strategy (payment gateways)**: `checkout_service` and `payment_service`
+  depend on the `PaymentGateway` ABC, not on Stripe. The concrete adapter is
+  injected in tests or resolved from `settings.PAYMENT_GATEWAY`.
+
+### Adding a new payment provider
+
+1. Create `core/gateways/paypal_gateway.py` implementing `PaymentGateway`
+   (`create_intent` + `parse_webhook_event`).
+2. Register it in `core/gateways/factory.py`:
+   ```python
+   GATEWAYS = {"stripe": StripeGateway, "paypal": PayPalGateway}
+   ```
+3. Set `PAYMENT_GATEWAY=paypal` in `.env`.
+
+No changes are required in the services or views.
 
 ## Setup Instructions
 
@@ -41,7 +83,11 @@ pip install -r requirements.txt
 ```
 
 ### 4. Configure Environment Variables
-Create a `.env` file in the project root. Below is an explanation of how to obtain each required key:
+Create a `.env` file in the project root (start from the provided template):
+```bash
+cp .env.example .env
+```
+Below is an explanation of how to obtain each required key:
 
 ```env
 SECRET_KEY=your-secret-key-must-be-at-least-32-bytes-long
@@ -52,6 +98,9 @@ ALLOWED_HOSTS=*
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 STRIPE_PUBLISHABLE_KEY=pk_test_...
+
+# Payment gateway strategy (see core/gateways/)
+PAYMENT_GATEWAY=stripe
 
 # CORS
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
@@ -97,6 +146,10 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
     *   This tells your API which frontend domains are allowed to make requests to it.
     *   For local development, keep it as `http://localhost:3000,http://localhost:5173` (common React/Vue ports).
     *   In production, change this to your frontend's actual URL (e.g., `https://your-frontend-app.com`).
+
+6.  **`PAYMENT_GATEWAY`:**
+    *   Selects which payment provider adapter the API uses (see [Project Architecture](#project-architecture)).
+    *   Default (and only registered) value: `stripe`. An unknown value fails loudly at runtime instead of falling back silently.
 
 ### 5. Apply Migrations
 ```bash

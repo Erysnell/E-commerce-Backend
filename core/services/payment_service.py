@@ -1,40 +1,46 @@
-"""Payment webhook processing: Stripe events → order state transitions."""
-import stripe
-from django.conf import settings
+"""Payment webhook processing: gateway events → order state transitions.
+
+`process_webhook` verifies and translates the raw payload through the
+gateway; `process_payment_event` applies the normalized event to our
+domain and can be tested without any provider mocks.
+"""
+from typing import Optional
+
 from django.db import transaction
 
+from ..gateways import PaymentEvent, PaymentEventType, PaymentGateway, get_payment_gateway
 from ..models import Cart, Order
-from .exceptions import OrderNotFoundError, PaymentError
+from .exceptions import OrderNotFoundError
 
 
-def process_webhook(payload: bytes, signature: str) -> str:
-    """Verify the Stripe signature and apply the event to our domain.
+def process_webhook(
+    payload: bytes,
+    signature: str,
+    gateway: Optional[PaymentGateway] = None,
+) -> str:
+    """Verify the webhook with the gateway and apply the event.
 
-    Returns the normalized action taken ('paid', 'failed' or 'ignored').
+    Returns the action taken ('paid', 'failed' or 'ignored').
     Raises PaymentError when the signature or payload is invalid.
     """
-    secret = settings.STRIPE_WEBHOOK_SECRET
-    if not secret:
-        raise PaymentError("Webhook secret is not configured")
+    gateway = gateway or get_payment_gateway()
 
-    try:
-        event = stripe.Webhook.construct_event(payload, signature, secret)
-    except ValueError as exc:
-        raise PaymentError("Invalid webhook payload") from exc
-    except stripe.error.SignatureVerificationError as exc:
-        raise PaymentError("Invalid webhook signature") from exc
+    event = gateway.parse_webhook_event(payload, signature)
+    if event is None:
+        return "ignored"
+    return process_payment_event(event)
 
-    event_type = event.get("type")
-    intent_id = event.get("data", {}).get("object", {}).get("id")
 
-    if event_type == "payment_intent.succeeded":
-        return _handle_payment_succeeded(intent_id)
-    if event_type == "payment_intent.payment_failed":
-        return _handle_payment_failed(intent_id)
+def process_payment_event(event: PaymentEvent) -> str:
+    """Apply a normalized payment event to the corresponding order."""
+    if event.type is PaymentEventType.PAYMENT_SUCCEEDED:
+        return _handle_payment_succeeded(event.intent_id)
+    if event.type is PaymentEventType.PAYMENT_FAILED:
+        return _handle_payment_failed(event.intent_id)
     return "ignored"
 
 
-def _handle_payment_succeeded(intent_id: str) -> str:
+def _handle_payment_succeeded(intent_id: Optional[str]) -> str:
     order = _get_order(intent_id)
 
     # Webhooks can be delivered more than once: make retries idempotent
@@ -49,7 +55,7 @@ def _handle_payment_succeeded(intent_id: str) -> str:
     return "paid"
 
 
-def _handle_payment_failed(intent_id: str) -> str:
+def _handle_payment_failed(intent_id: Optional[str]) -> str:
     order = _get_order(intent_id)
     if order.status != Order.Status.PAID:
         order.status = Order.Status.FAILED
@@ -57,7 +63,7 @@ def _handle_payment_failed(intent_id: str) -> str:
     return "failed"
 
 
-def _get_order(intent_id: str) -> Order:
+def _get_order(intent_id: Optional[str]) -> Order:
     if not intent_id:
         raise OrderNotFoundError(intent_id)
     try:
