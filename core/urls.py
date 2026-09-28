@@ -10,10 +10,10 @@ from .views import (
     CheckoutView,
     CustomTokenObtainPairView,
     OrderListView,
+    PaymentWebhookView,
     ProductViewSet,
     ProfileView,
     RegisterView,
-    StripeWebhookView,
 )
 
 router = DefaultRouter()
@@ -34,7 +34,7 @@ urlpatterns = [
 
     # Checkout & Payments
     path('checkout/', CheckoutView.as_view(), name='checkout'),
-    path('payments/webhook/', StripeWebhookView.as_view(), name='stripe_webhook'),
+    path('payments/webhook/', PaymentWebhookView.as_view(), name='stripe_webhook'),
     path('orders/', OrderListView.as_view(), name='order_list'),
 
     # Router URLs for Categories and Products

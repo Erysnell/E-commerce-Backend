@@ -78,6 +78,17 @@ class CartItemSerializer(serializers.ModelSerializer):
         return float(obj.product.price * obj.quantity)
 
 
+class CartItemAddSerializer(serializers.Serializer):
+    """Input validation for adding a product to the cart.
+
+    Domain rules (existence, stock) live in the cart service;
+    this serializer only enforces the shape of the request.
+    """
+
+    product = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1, default=1, required=False)
+
+
 class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)
     total = serializers.SerializerMethodField()

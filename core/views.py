@@ -1,6 +1,3 @@
-import stripe
-from django.conf import settings
-from django.db import transaction
 from django.http import HttpResponse
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status, viewsets
@@ -8,8 +5,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import Cart, CartItem, Category, Order, OrderItem, Product
+from .models import CartItem, Category, Order, Product
 from .serializers import (
+    CartItemAddSerializer,
     CartItemSerializer,
     CartSerializer,
     CategorySerializer,
@@ -20,8 +18,15 @@ from .serializers import (
     UserRegistrationSerializer,
     UserSerializer,
 )
-
-stripe.api_key = settings.STRIPE_SECRET_KEY
+from .services import cart_service, checkout_service, payment_service
+from .services.exceptions import (
+    CartNotFoundError,
+    EmptyCartError,
+    OrderNotFoundError,
+    OutOfStockError,
+    PaymentError,
+    ProductNotFoundError,
+)
 
 # ---------------------------------------------------------
 # Authentication
@@ -124,41 +129,28 @@ class CartView(generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self):
-        cart, _ = Cart.objects.get_or_create(user=self.request.user)
-        return cart
+        return cart_service.get_or_create_cart(self.request.user)
 
 
-class CartItemCreateView(generics.CreateAPIView):
-    serializer_class = CartItemSerializer
+class CartItemCreateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @extend_schema(tags=['Cart'], summary="Add a product to the cart")
-    def post(self, request, *args, **kwargs):
-        cart, _ = Cart.objects.get_or_create(user=request.user)
-        product_id = request.data.get('product')
-        quantity = int(request.data.get('quantity', 1))
-
-        if not product_id:
-            return Response({"error": "Product ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+    def post(self, request):
+        input_serializer = CartItemAddSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
 
         try:
-            product = Product.objects.get(id=product_id, is_active=True)
-        except Product.DoesNotExist:
+            cart_item = cart_service.add_item(
+                user=request.user,
+                product_id=input_serializer.validated_data['product'],
+                quantity=input_serializer.validated_data['quantity'],
+            )
+        except ProductNotFoundError:
             return Response({"error": "Product not found"}, status=status.HTTP_404_NOT_FOUND)
+        except OutOfStockError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        if product.stock < quantity:
-            return Response({"error": "Not enough stock"}, status=status.HTTP_400_BAD_REQUEST)
-
-        cart_item, created = CartItem.objects.get_or_create(cart=cart, product=product)
-        if not created:
-            cart_item.quantity += quantity
-        else:
-            cart_item.quantity = quantity
-
-        if cart_item.quantity > product.stock:
-            return Response({"error": "Not enough stock"}, status=status.HTTP_400_BAD_REQUEST)
-
-        cart_item.save()
         serializer = CartItemSerializer(cart_item)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -169,16 +161,17 @@ class CartItemDeleteView(APIView):
     @extend_schema(tags=['Cart'], summary="Remove a product from the cart")
     def delete(self, request, item_id):
         try:
-            cart_item = CartItem.objects.get(id=item_id, cart__user=request.user)
+            cart_service.remove_item(user=request.user, item_id=item_id)
         except CartItem.DoesNotExist:
-            return Response({"error": "Item not found in your cart"}, status=status.HTTP_404_NOT_FOUND)
-        
-        cart_item.delete()
+            return Response(
+                {"error": "Item not found in your cart"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------
-# Checkout & Payments (Stripe)
+# Checkout & Payments
 # ---------------------------------------------------------
 
 class CheckoutView(APIView):
@@ -186,119 +179,42 @@ class CheckoutView(APIView):
 
     @extend_schema(tags=['Payments'], summary="Initialize checkout and create Stripe PaymentIntent")
     def post(self, request):
+        input_serializer = CheckoutSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+
         try:
-            cart = Cart.objects.get(user=request.user)
-        except Cart.DoesNotExist:
-            return Response({"error": "Cart not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        if not cart.items.exists():
-            return Response({"error": "Cart is empty"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Check stock availability
-        for item in cart.items.all():
-            if item.product.stock < item.quantity:
-                return Response(
-                    {"error": f"Not enough stock for {item.product.name}"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-        serializer = CheckoutSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        shipping_address = serializer.validated_data.get('shipping_address', '')
-
-        # Calculate total
-        total_amount = sum(item.product.price * item.quantity for item in cart.items.all())
-
-        # Create Stripe PaymentIntent
-        try:
-            intent = stripe.PaymentIntent.create(
-                amount=int(total_amount * 100),  # Stripe uses cents
-                currency='usd',
-                metadata={'user_id': request.user.id, 'cart_id': cart.id},
-                automatic_payment_methods={'enabled': True},
-            )
-        except stripe.error.StripeError as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Create Order in Database
-        with transaction.atomic():
-            order = Order.objects.create(
+            result = checkout_service.checkout(
                 user=request.user,
-                total_amount=total_amount,
-                status=Order.Status.PENDING,
-                stripe_payment_intent_id=intent.id,
-                shipping_address=shipping_address,
+                shipping_address=input_serializer.validated_data.get('shipping_address', ''),
             )
-
-            for item in cart.items.all():
-                OrderItem.objects.create(
-                    order=order,
-                    product=item.product,
-                    product_name=item.product.name,
-                    price=item.product.price,
-                    quantity=item.quantity,
-                )
+        except CartNotFoundError:
+            return Response({"error": "Cart not found"}, status=status.HTTP_404_NOT_FOUND)
+        except EmptyCartError:
+            return Response({"error": "Cart is empty"}, status=status.HTTP_400_BAD_REQUEST)
+        except OutOfStockError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except PaymentError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
-            'order_id': order.id,
-            'client_secret': intent.client_secret,
-            'total_amount': str(total_amount),
+            'order_id': result.order.id,
+            'client_secret': result.client_secret,
+            'total_amount': str(result.order.total_amount),
         }, status=status.HTTP_201_CREATED)
 
 
-class StripeWebhookView(APIView):
+class PaymentWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
-    @extend_schema(tags=['Payments'], summary="Stripe Webhook listener")
+    @extend_schema(tags=['Payments'], summary="Payment gateway webhook listener")
     def post(self, request):
-        payload = request.body
-        sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
-        event = None
-
+        signature = request.META.get('HTTP_STRIPE_SIGNATURE', '')
         try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
-            )
-        except ValueError:
+            payment_service.process_webhook(request.body, signature)
+        except PaymentError:
             return HttpResponse(status=400)
-        except stripe.error.SignatureVerificationError:
-            return HttpResponse(status=400)
-
-        if event['type'] == 'payment_intent.succeeded':
-            payment_intent = event['data']['object']
-            payment_intent_id = payment_intent.get('id')
-            
-            try:
-                order = Order.objects.get(stripe_payment_intent_id=payment_intent_id)
-                # Update Order status to PAID
-                order.status = Order.Status.PAID
-                order.save()
-
-                # Reduce stock
-                with transaction.atomic():
-                    for item in order.items.all():
-                        product = item.product
-                        if product:
-                            product.stock -= item.quantity
-                            product.save()
-
-                # Clear user's cart
-                Cart.objects.filter(user=order.user).delete()
-
-            except Order.DoesNotExist:
-                return HttpResponse(status=404)
-
-        elif event['type'] == 'payment_intent.payment_failed':
-            payment_intent = event['data']['object']
-            payment_intent_id = payment_intent.get('id')
-            
-            try:
-                order = Order.objects.get(stripe_payment_intent_id=payment_intent_id)
-                order.status = Order.Status.FAILED
-                order.save()
-            except Order.DoesNotExist:
-                return HttpResponse(status=404)
-
+        except OrderNotFoundError:
+            return HttpResponse(status=404)
         return HttpResponse(status=200)
 
 
