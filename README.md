@@ -39,6 +39,8 @@ core/
 │   ├── base.py             # PaymentGateway ABC + PaymentEvent/Result
 │   ├── stripe_gateway.py   # Stripe adapter
 │   └── factory.py          # runtime selection via settings.PAYMENT_GATEWAY
+├── management/commands/
+│   └── confirm_payment.py  # test a PaymentIntent without a frontend
 └── models.py           # Persistence (Active Record via Django ORM)
 ```
 
@@ -130,7 +132,9 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
         1.  Install the [Stripe CLI](https://docs.stripe.com/stripe-cli).
         2.  Run the following command to start a local listener:
             ```bash
-            stripe listen --forward-to localhost:8000/api/payments/webhook/
+            stripe listen \
+              --events payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled \
+              --forward-to localhost:8000/api/payments/webhook/
             ```
         3.  The CLI will output a `whsec_...` secret. Copy this and add it to your `.env`.
     *   **Option B (Stripe Dashboard for Production):**
@@ -189,7 +193,7 @@ python manage.py runserver
 ### Checkout & Orders
 - `POST /api/checkout/`: Initialize payment and get Stripe `client_secret`.
 - `GET /api/orders/`: View user's order history.
-- `POST /api/payments/webhook/`: Stripe Webhook endpoint.
+- `POST /api/payments/webhook/`: Payment gateway webhook endpoint (verify with `stripe listen` locally).
 
 ## API Documentation
 Once the server is running, visit:
@@ -200,16 +204,54 @@ Once the server is running, visit:
 Visit [http://localhost:8000/admin/](http://localhost:8000/admin/) and log in with your superuser credentials.
 
 ## Testing
-Run the test suite with:
+
+Run the 29-test suite with:
 ```bash
 python manage.py test core
 ```
+Coverage: JWT auth, product search/filters, cart business rules (stock limits,
+quantity merging), checkout orchestration with a fake gateway, webhook
+state transitions (idempotent retries), and the gateway factory.
 
 ## Stripe Integration
-To test the payment flow:
-1. Use Stripe test cards (e.g., `4242 4242 4242 4242`).
-2. Set up a local webhook listener using the Stripe CLI:
+
+### Testing the payment flow (backend only, no frontend needed)
+
+1. Start the webhook listener (keep it running):
    ```bash
-   stripe listen --forward-to localhost:8000/api/payments/webhook/
+   stripe listen \
+     --events payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled \
+     --forward-to localhost:8000/api/payments/webhook/
    ```
-3. Copy the `whsec_...` from the CLI output into your `.env` file.
+   Make sure the `whsec_...` it prints matches `STRIPE_WEBHOOK_SECRET` in your `.env`
+   (restart the Django server after changing `.env`).
+
+2. Create an order (authenticated):
+   ```bash
+   curl -X POST localhost:8000/api/checkout/ \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"shipping_address": "Test street 123"}'
+   ```
+   Response includes `order_id`, `total_amount` and the Stripe `client_secret`
+   (the `pi_...` id inside it).
+
+3. Confirm the payment with a test card:
+   ```bash
+   python manage.py confirm_payment pi_XXXX            # succeeds (4242 card)
+   python manage.py confirm_payment pi_XXXX --fail      # declined card
+   ```
+
+4. Verify the results:
+   - Listener shows `payment_intent.succeeded` → API responds **200**.
+   - `GET /api/orders/` → order status **PAID** (or **FAILED** with `--fail`).
+   - `GET /api/products/` → stock was reduced only on success.
+   - `GET /api/cart/` → cleared after a successful payment.
+
+### Test cards
+| Card | Result |
+|---|---|
+| `4242 4242 4242 4242` | Succeeds |
+| `0000 0000 0000 0000` | Declined |
+
+Use these from a frontend with Stripe.js and your `STRIPE_PUBLISHABLE_KEY`
+(the backend flow above uses Stripe test payment methods instead).
