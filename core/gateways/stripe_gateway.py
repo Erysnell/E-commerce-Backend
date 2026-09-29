@@ -53,7 +53,12 @@ class StripeGateway(PaymentGateway):
                 amount=self._to_minor_units(amount),
                 currency=currency,
                 metadata=metadata or {},
-                automatic_payment_methods={"enabled": True},
+                automatic_payment_methods={
+                    "enabled": True,
+                    # Backend-only flow: never redirect the customer off-page
+                    # (Stripe requires a return_url otherwise)
+                    "allow_redirects": "never",
+                },
                 api_key=self.api_key,  # per-request key, no global state
             )
         except stripe.error.StripeError as exc:
